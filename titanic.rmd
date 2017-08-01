@@ -1,0 +1,368 @@
+---
+title: "Titanic"
+output: html_notebook
+---
+
+In this competition, The task is to predict the fate of the passengers aboard the Titanic, which famously sank in the Atlantic ocean during its maiden voyage from the UK to New York City after colliding with an iceberg. 
+
+The dataset contains features pertaining to each passenger who boarded the ship. We have the following information for each passenger
+
+....Insert table for parameters.....
+
+This problem is the 'Hello World' for Data Science and provides a perfect platform for those who would like to venture into the field of predictive modeling and machine learning. Most of us having seen the movie can easily relate to the situation. Also there is no need for domain knowledge of any kind in order to do feature engineering or understanding features affecting the odds of survival for a passenger.
+
+Loading the necessary libraries and datasets
+```{r}
+library(dplyr)
+library(stringr)
+library(mice)
+library(caret)
+library(caTools)
+library(ggplot2)
+library(gridExtra)
+setwd("C:/Users/ankit/Desktop/R/Titanic")
+#Read train and test
+train <- read.csv("train.csv", na.strings = c("","NaN"," "),stringsAsFactors = FALSE)
+test <- read.csv("test.csv", na.strings = c("","NaN"," "),stringsAsFactors = FALSE)
+test$Survived <- 1
+```
+
+Combining both the train and test sets to look at data as a whole and treating the missing values for both sets
+
+```{r}
+df.titanic <- rbind(train,test)
+glimpse(df.titanic)
+```
+
+Summarising the missing data to decide upon the features that could be imputed
+
+```{r}
+#Missing Values Summary
+Feature <- colnames(df.titanic)
+NA_Percentage <- sapply(df.titanic, function(x) round(100 * sum(is.na(x))/nrow(df.titanic),2))
+NA_Count <- sapply(df.titanic, function(x) sum(is.na(x)))
+arrange(data.frame(Feature, NA_Percentage, NA_Count),desc(NA_Percentage))
+```
+
+Clearly, the feature cabin cannot be imputed reliably considering that 77% of data is missing. 
+Embarked has only 2 missing values which we can replace by the mode
+
+```{r}
+ggplot(df.titanic, aes(x = Embarked)) + geom_bar()
+```
+
+```{r}
+ggplot(df.titanic, aes(x = Embarked, y = Fare)) + geom_boxplot() + ylim(0,100)
+```
+
+```{r}
+df.titanic$Fare[is.na(df.titanic$Embarked)]
+```
+
+From the boxplot and the fare for the missing 'Embarked', we conclude that these 2 passengers must have embarked from Southampton
+
+```{r}
+df.titanic$Embarked[is.na(df.titanic$Embarked)] <- "S"
+summary(factor(df.titanic$Embarked))
+```
+
+Next we deal with the lone missing value in the feature 'Fare'. It is a fair assumption that the fare would be decided majorly on the basis of 2 variables - PClass and Embarked.
+
+```{r}
+df.titanic[is.na(df.titanic$Fare),c('Pclass', 'Embarked')]
+```
+
+We replace the missing value by the median fare pertaining to these 2 categories.
+
+```{r}
+df.titanic$Fare[is.na(df.titanic$Fare)] <- median(df.titanic[df.titanic$Pclass == '3' & df.titanic$Embarked == 'S', ]$Fare, na.rm = TRUE)
+summary(df.titanic$Fare)
+```
+Hang on! the fare also contains a few 0's which might be due to missing information or some other reason. However, for modeling purposes we would still want to impute them appropriately
+
+```{r}
+nrow(df.titanic[df.titanic$Fare == 0,])
+```
+
+The are 17 passengers with 0 value for fare. Lets impute it in a similar manner 
+
+```{r}
+med_fare <- df.titanic %>%
+  group_by(Pclass, Embarked) %>%
+  summarise(median = median(Fare), count = n())
+idx <- which(df.titanic$Fare == 0)
+
+for (i in idx){
+  fare.median = med_fare[med_fare$Pclass == df.titanic$Pclass[i] & med_fare$Embarked == df.titanic$Embarked[i],'median',]
+  df.titanic[i,'Fare'] = fare.median[[1]]
+}
+summary(df.titanic$Fare)
+```
+
+Age has a large number of missing values and it might not be the best idea to impute it by simple methodologies like median imputation and hence we will first work out the new features that might help in its imputation
+
+
+This is one of the most interesting parts that is a make or break for any data science competition. Here, we create new features from the existing ones that help in building a more robust model.
+
+Begining with the name feature.
+
+```{r}
+head(df.titanic$Name)
+```
+
+By using the name we can obtain the following insights:
+- figure out all the family members
+- isolate passengers with important professions/noble families
+
+```{r}
+#Feature Engineering
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+df.titanic$Title <- sapply(df.titanic$Name, FUN=function(x) {trim(strsplit(x, split='[,.]')[[1]][2])})
+
+df.titanic$Title[df.titanic$Title %in% c('Mme')] <- 'Mrs'
+df.titanic$Title[df.titanic$Title %in% c('Mlle')] <- 'Miss'
+df.titanic$Title[df.titanic$Title %in% c('Ms')] <- 'Miss'
+df.titanic$Title[df.titanic$Title %in% c('Capt','Col','Don','Major','Sir','Jonkheer')] <- 'Sir'
+df.titanic$Title[df.titanic$Title %in% c('Dona','Lady','the Countess')] <- 'Lady'
+df.titanic$Title <- factor(df.titanic$Title)
+summary(df.titanic$Title)
+```
+
+Now, we create a feature called family size as follows
+
+```{r}
+df.titanic$FSize <- df.titanic$Parch + df.titanic$SibSp + 1
+summary(df.titanic$FSize)
+```
+
+Now that we have created all necessary features that could be used for imputing the Age feature.
+
+We will perform a Random forest algorithm for determining the missing ages
+
+```{r}
+#Convert Factor variables to factors
+factor_vars <- c('PassengerId','Sex','Embarked',
+                 'Title','Survived')
+df.titanic[factor_vars] <- lapply(df.titanic[factor_vars], function(x) as.factor(x))
+
+# Set a random seed
+set.seed(129)
+
+# Perform mice imputation, excluding certain variables:
+mice_mod <- mice(df.titanic[, !names(df.titanic) %in% c('PassengerId','Name','Ticket','Cabin','Survived','Sex')], method='rf')
+mice_output <- complete(mice_mod)
+# Replace Age variable from the mice model
+df.titanic$Age <- mice_output$Age
+# df.titanic$Age <- ifelse(df.titanic$Age - floor(df.titanic$Age) == 0,df.titanic$Age, floor(df.titanic$Age) + 0.5)
+summary(df.titanic$Age)
+```
+
+To further reduce the noise in the age feature we will categorise into children and adults
+
+```{r}
+df.titanic$Child <- factor(ifelse(df.titanic$Age <= 18,"Child","Adult"))
+```
+
+Identifying large families as seperate categories since they might have a disadvantage in survival as they will try to stick togather or save a fellow member before worrying about himself/herself. 
+Lastly, we would design a new feature that factorises families into the large ones and others that are small
+
+```{r}
+df.titanic$Surname <- sapply(as.character(df.titanic$Name), FUN=function(x) {trim(strsplit(x, split='[,.]')[[1]][1])})
+df.titanic$Family <- paste(df.titanic$FSize,df.titanic$Surname, sep = '_')
+famIDs <- data.frame(table(df.titanic$Family))
+famIDs <- famIDs[famIDs$Freq <= 3,]
+df.titanic$Family[df.titanic$Family %in% famIDs$Var1] <- 'Small'
+df.titanic$Family <- factor(df.titanic$Family)
+df.titanic$Family[df.titanic$FSize %in% c(1,2,3)] <- 'Small'
+df.titanic$Family <- droplevels(df.titanic$Family)
+summary(df.titanic$Family)
+```
+
+As we have all the engineered features now, lets use the Boruta package to weed out any unimportant features as they might lead to unwarranted complexity in the model and thus leading to instabililty.
+
+
+```{r}
+df.titanic$Survived <- ifelse(df.titanic$Survived == 1,"Y","N")
+df.titanic$Survived <- factor(df.titanic$Survived)
+new_train <- df.titanic[1:nrow(train),]
+new_test <- df.titanic[-(1:nrow(train)),]
+library(Boruta)
+set.seed(123)
+boruta.train <- Boruta(Survived ~ Pclass + Sex + Embarked + Age + FSize + Fare + Parch + SibSp + Family + Child + Title, data = new_train, doTrace = 2)
+```
+
+
+```{r}
+plot(boruta.train, xlab = "", xaxt = "n")
+lz<-lapply(1:ncol(boruta.train$ImpHistory),function(i)
+boruta.train$ImpHistory[is.finite(boruta.train$ImpHistory[,i]),i])
+names(lz) <- colnames(boruta.train$ImpHistory)
+Labels <- sort(sapply(lz,median))
+axis(side = 1,las=2,labels = names(Labels),
+at = 1:ncol(boruta.train$ImpHistory), cex.axis = 0.7)
+```
+
+At first we will begin with submiting a very simple model in which all females survive to set a benchmark. 
+
+```{r}
+
+pred_gender_model <- ifelse(test$Sex == "female",1,0)
+
+submit <- data.frame(PassengerId = test$PassengerId,Survived = pred_gender_model)
+write.csv(submit,"C:/Users/ankit/Desktop/R/Titanic/gender_model.csv",row.names = FALSE)
+
+```
+
+We got a kaggle score of 0.76555 with just this model.
+
+
+Hmm, Boruta tells us that all the features that we have created are important to the target variable in one way or other and hence we will stick with it for the time being.
+
+The relative importance of Sex is much higher than anything else as women were given preference in allotment of life boats while the ship was sinking.
+
+However, other features are also not performing badly.
+
+We will start with a prediction using a Logistic Regression model and see whether we have an improved result
+
+
+```{r}
+
+set.seed(123)
+myControl <- trainControl(
+  method = "repeatedcv",
+  number = 3,
+  repeats = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE
+)
+
+glm_model <- train(Survived ~ Pclass + Sex + Embarked + Age + FSize + Fare + Parch + SibSp + Family + Child + Title,
+                   new_train,
+                   method = "glm",
+                   family = "binomial",
+                   metric = "ROC",
+                   trControl = myControl)
+
+p <- predict(glm_model,type = "prob")
+colAUC(p, new_train[["Survived"]], plotROC = TRUE)
+summary(glm_model)
+p_glm <- predict(glm_model,new_test,type = "raw")
+submit <- data.frame(PassengerId = test$PassengerId,Survived = ifelse(p_glm=="Y",1,0))
+write.csv(submit,"C:/Users/ankit/Desktop/R/Titanic/log_reg.csv",row.names = FALSE)
+
+```
+
+
+This produces a kaggle score of 0.77033 which is a very slight improvement over the simple gender model.
+
+This means there are non linearities which cannot be modeled using the logistic regression and hence our next step should be to try a tree based method. Lets start with decision tree.
+
+```{r}
+       
+dt_model <- train(Survived ~ Pclass + Sex + Age + Embarked + Fare + Parch + SibSp,
+               new_train,
+               method = 'rpart',
+               metric = "ROC",
+               trControl = myControl)
+
+library(rattle)
+fancyRpartPlot(dt_model$finalModel)
+
+p_dt <- predict(dt_model,new_test,type = "raw")
+submit <- data.frame(PassengerId = test$PassengerId,Survived = ifelse(p_dt=="Y",1,0))
+write.csv(submit,"C:/Users/ankit/Desktop/R/Titanic/dt_mod.csv",row.names = FALSE)
+```
+```{r}
+
+
+```
+
+Yes, Indeed the decision tree performed well giving a leaderboard score of 0.79904. However we still were not able to use all the important features as described by the Boruta package. 
+
+So, next we will use an ensemble model - The Random Forest
+
+```{r}
+set.seed(123)
+myControl <- trainControl(
+  method = "repeatedcv",
+  number = 3,
+  repeats = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE
+)
+
+rf_model <- train(Survived ~ Pclass + Sex + Embarked + FSize + Fare + Child + Title,
+               new_train,
+               method = 'rf',
+               metric = "ROC",
+               trControl = myControl,
+               allowParallel = TRUE)
+
+
+p_rf <- predict(dt_model,new_test,type = "raw")
+submit <- data.frame(PassengerId = test$PassengerId,Survived = ifelse(p_rf=="Y",1,0))
+write.csv(submit,"C:/Users/ankit/Desktop/R/Titanic/rf_mod.csv",row.names = FALSE)
+```
+
+Sadly this model also produced the same score as the decision tree. We will go ahead and try SVM for classification
+
+
+```{r}
+myControl <- trainControl(
+  method = "repeatedcv",
+  savePredictions = TRUE,
+  number = 3,
+  repeats = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  verboseIter = TRUE
+)
+svm_model <- train(Survived ~ Pclass + Sex + Embarked + Age + FSize + Fare + Parch + SibSp + Family + Child + Title,
+               new_train,
+               method = 'svmRadial',
+               metric = "ROC",
+               trControl = myControl
+               )
+pred_svm <- predict(svm_model,new_test)
+submit <- data.frame(PassengerId = test$PassengerId,Survived = ifelse(pred_svm=="Y",1,0))
+write.csv(submit,"C:/Users/ankit/Desktop/R/Titanic/svm_mod.csv",row.names = FALSE)
+```
+
+```{r}
+library(dummies)
+df.titanic.new <- dummy.data.frame(df.titanic,names = c('Embarked','Title','Family'), sep = "_")
+```
+
+```{r}
+library(xgboost)
+library(purrr)
+drop.cols <- c('PassengerId','Survived','Name','Ticket','Cabin','Surname')
+df.titanic.new <- df.titanic.new[,!names(df.titanic.new) %in% drop.cols]
+df.titanic.new <- as.data.frame(map(df.titanic.new, as.numeric))
+x_train <- df.titanic.new[1:nrow(train),]
+x_test <- df.titanic.new[-(1:nrow(train)),]
+y_train <- train$Survived
+dtrain <- xgb.DMatrix(as.matrix(x_train), label = y_train)
+dtest <- xgb.DMatrix(as.matrix(x_test))
+```
+
+```{r}
+xgb_params = list(
+  booster = 'gbtree',
+  objective = "binary:logistic",
+  colsample_bytree=1,
+  eta=0.05,
+  max_depth=2,
+  subsample=0.8,
+  seed=5,
+  silent=TRUE)
+
+xgb.cv(xgb_params, dtrain, nrounds = 1000, nfold = 4, early_stopping_rounds = 100)
+bst <- xgb.train(data = dtrain, params = xgb_params, nround=109)
+```
+
+```{r}
+pred_xgb <- predict(bst, dtest, type = "prob")
+
+```
+
